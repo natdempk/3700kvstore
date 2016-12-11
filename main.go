@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"time"
@@ -31,12 +33,13 @@ type Message struct {
 	Entries      []LogItem `json:"entries"`
 	LeaderCommit int       `json:"leaderCommit"`
 	Success      bool      `json:"success"`
+	CommitIndex  int       `json:"currentCommit"`
 }
 
 type LogItem struct {
-	Key   string
-	Value string
-	Term  int
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	Term  int    `json:"term"`
 }
 
 var conn net.Conn
@@ -47,7 +50,6 @@ const FOLLOWER = "follower"
 const CANDIDATE = "candidate"
 const LEADER_APPEND_ENTRIES = "leader_append_entries"
 const RESPONSE_APPEND_ENTRIES = "response_append_entries"
-const ENTRIES_BUFFER_SIZE = 100
 
 // global state
 var myID string
@@ -55,36 +57,35 @@ var leaderID string
 var state = FOLLOWER
 var currentTerm = 0
 var votedFor = ""
-var log []LogItem
+var log []LogItem = []LogItem{}
 var commitIndex = 0
 var lastApplied = 0
 var lastLogTerm = 0
 
 var lastHeartbeatTime = time.Now()
 
-var ELECTION_TIMEOUT = getElectionTimeout()
 var currentTermVotes = 0
 var replicaIDs []string
 
-var entriesToAppend = make(chan LogItem, ENTRIES_BUFFER_SIZE)
+var committedValues = make(map[string]string)
 
-var committedValues = make([string]string)
-
-// change to maps
 // leader state
-var nextindex []int
-var matchIndex []int
+var nextIndex = make(map[string]int)
+var matchIndex = make(map[string]int)
 
 func getElectionTimeout() (timeout time.Duration) {
 	// change this later
-	return 250 * time.Millisecond
+	s := rand.NewSource(time.Now().UnixNano())
+	r := rand.New(s)
+
+	return time.Duration(300+r.Int31n(2000)) * time.Millisecond
 }
 
 func main() {
 	myID = os.Args[1]
 	replicaIDs = os.Args[2:]
 
-	var err error = nil
+	var err error
 	conn, err = net.Dial("unixpacket", myID)
 
 	if err != nil {
@@ -99,28 +100,83 @@ func main() {
 
 	for {
 		var message Message
+
+		var j []byte = make([]byte, 1000)
+		d.Buffered().Read(j)
+		fmt.Println("Buffer Start::::::")
+		fmt.Println(string(j))
+		fmt.Println("Buffer End:::::::")
+
 		err := d.Decode(&message)
 		if err != nil {
 			fmt.Printf("horrible error")
+			fmt.Println(err)
+			var p []byte = make([]byte, 1000)
+
+			bufio.NewReader(conn).Read(p)
+			fmt.Println(string(p))
 			panic(err)
 		}
-
-		fmt.Println(message)
 
 		switch message.Type {
 		case "get":
 			fmt.Println("get")
+			break
 			if state == LEADER {
 				// provide results
+				found := false
+				for i := len(log) - 1; i >= 0; i-- {
+					if log[i].Key == message.Key {
+						okMessage := Message{
+							ID:          message.ID,
+							Source:      myID,
+							Destination: message.Source,
+							Leader:      leaderID,
+							Type:        "ok",
+							Value:       log[i].Value,
+						}
+						found = true
+						sendMessage(okMessage)
+						break
+					}
+				}
+
+				if !found {
+					failureMessage := Message{
+						ID:          message.ID,
+						Source:      myID,
+						Destination: message.Source,
+						Leader:      leaderID,
+						Type:        "ok",
+					}
+					sendMessage(failureMessage)
+				}
+
 			} else {
-				sendRedirect(message.Source)
+				sendRedirect(message.Source, message.ID)
 			}
 		case "put":
 			fmt.Println("put")
 			if state == LEADER {
 				// store results
+				log = append(log, LogItem{
+					Key:   message.Key,
+					Value: message.Value,
+					Term:  currentTerm,
+				})
+				okMessage := Message{
+					ID:          message.ID,
+					Source:      myID,
+					Destination: message.Source,
+					Leader:      leaderID,
+					Type:        "ok",
+				}
+				break
+				sendMessage(okMessage)
 			} else {
-				sendRedirect(message.Source)
+				fmt.Println("REDIRECT")
+				break
+				sendRedirect(message.Source, message.ID)
 			}
 		case "redirect":
 			fmt.Println("THIS SHOULD NEVER HAPPEN")
@@ -133,14 +189,20 @@ func main() {
 		case LEADER_APPEND_ENTRIES:
 			handleAppendEntries(message)
 		case RESPONSE_APPEND_ENTRIES:
-			// TOOD: handle failures?
-			fmt.Println("ok")
+			if message.Success {
+				nextIndex[message.Source] = message.CommitIndex + 1
+				matchIndex[message.Source] = message.CommitIndex
+			} else { // we aren't the leader
+				// decremented nextIndex and retry
+				nextIndex[message.Source] = message.CommitIndex + 1
+			}
 		case "requestVote":
 			if message.Term < currentTerm {
 				// send false
 				sendVote(message.Source, false)
 			} else if (votedFor == "" || votedFor == message.CandidateID) && message.LastLogIndex >= lastApplied {
 				// send vote
+				votedFor = message.CandidateID
 				sendVote(message.Source, true)
 			} else {
 				// vote false, we might be able to not vote for efficiency
@@ -158,8 +220,14 @@ func main() {
 				// we are elected leader
 				fmt.Printf("LEADER ELECTED: %v\n", myID)
 				state = LEADER
+				leaderID = myID
+				// reinitialize matchIndex and nextIndex
+				for _, replica := range replicaIDs {
+					go sendAppendEntriesRpc(replica)
+					nextIndex[replica] = commitIndex + 1
+					matchIndex[replica] = 0
+				}
 			}
-
 		}
 	}
 }
@@ -168,10 +236,11 @@ func checkForElection() {
 	const ELECTION_SLEEP_TIME = 50 * time.Millisecond
 
 	for {
-		if time.Since(lastHeartbeatTime) > ELECTION_TIMEOUT {
+		if state == FOLLOWER && time.Since(lastHeartbeatTime) > getElectionTimeout() {
 			currentTerm++
 			currentTermVotes++
 			state = CANDIDATE
+			votedFor = myID
 
 			electMe := Message{
 				ID:           uuid.NewV4().String(),
@@ -192,24 +261,23 @@ func checkForElection() {
 	}
 }
 
-func sendAppendEntriesRpc() {
-	const HEARTBEAT_TIMEOUT = 50 * time.Millisecond
+func sendAppendEntriesRpc(destination string) {
+	const HEARTBEAT_TIMEOUT = 200 * time.Millisecond
 	const HEARTBEAT_SLEEP_TIME = 25 * time.Millisecond
-	for {
-		if len(entriesToAppend) == ENTRIES_BUFFER_SIZE || time.Since(lastHeartbeatTime) > HEARTBEAT_TIMEOUT {
+	leaderLastHeartbeatTime := time.Unix(0, 0)
 
-			var actualEntries []LogItem
-
-			entriesToConsume := len(entriesToAppend)
-
-			for i := 0; i < entriesToConsume; i++ {
-				actualEntries = append(actualEntries, <-entriesToAppend)
+	for state == LEADER {
+		if time.Since(leaderLastHeartbeatTime) > HEARTBEAT_TIMEOUT {
+			logOffset := min(nextIndex[destination], len(log)-1)
+			if logOffset < 0 {
+				logOffset = 0
 			}
+			var actualEntries = log[logOffset:]
 
 			appendEntriesMessage := Message{
 				ID:           uuid.NewV4().String(),
 				Type:         LEADER_APPEND_ENTRIES,
-				Destination:  "FFFF",
+				Destination:  destination,
 				Source:       myID,
 				Leader:       leaderID,
 				Term:         currentTerm,
@@ -220,6 +288,7 @@ func sendAppendEntriesRpc() {
 			}
 
 			sendMessage(appendEntriesMessage)
+			leaderLastHeartbeatTime = time.Now()
 		}
 
 		time.Sleep(HEARTBEAT_SLEEP_TIME)
@@ -227,9 +296,25 @@ func sendAppendEntriesRpc() {
 }
 
 func handleAppendEntries(message Message) {
+
+	if len(message.Entries) > 0 {
+		fmt.Println("AKLSDJKLASJDKLJKLSALJKADLJLJDASJLKJKKLJDSKJLASDL")
+	}
+
+	// THIS MIGHT BE WRONG
+	if (state == CANDIDATE || state == FOLLOWER) &&
+		(message.Term > currentTerm || message.Leader != leaderID) {
+		currentTerm = message.Term
+		leaderID = message.Leader
+		state = FOLLOWER
+	}
+
+	lastHeartbeatTime = time.Now()
+
 	responseMessage := Message{
 		Source:      myID,
 		Destination: leaderID,
+		Leader:      leaderID,
 		ID:          uuid.NewV4().String(),
 		Type:        RESPONSE_APPEND_ENTRIES,
 		Term:        currentTerm,
@@ -237,7 +322,7 @@ func handleAppendEntries(message Message) {
 
 	if message.Term < currentTerm {
 		responseMessage.Success = false
-	} else if len(log)-1 != message.PrevLogIndex &&
+	} else if max(len(log)-1, 0) != message.PrevLogIndex &&
 		log[message.PrevLogIndex].Term != message.PrevLogTerm {
 		responseMessage.Success = false
 	} else if len(log)-1 > message.PrevLogIndex {
@@ -264,12 +349,14 @@ func handleAppendEntries(message Message) {
 		}
 	}
 
+	responseMessage.CommitIndex = commitIndex
+
 	sendMessage(responseMessage)
 }
 
-func sendRedirect(destination string) {
+func sendRedirect(destination, messageID string) {
 	redirectMessage := Message{
-		ID:          uuid.NewV4().String(),
+		ID:          messageID,
 		Destination: destination,
 		Source:      myID,
 		Leader:      leaderID,
@@ -301,5 +388,23 @@ func sendMessage(message Message) {
 		panic(err)
 	}
 
-	fmt.Fprintf(conn, string(bytes))
+	//fmt.Fprintf(conn, string(bytes))
+	if len(log) != 0 {
+		fmt.Println(string(bytes))
+	}
+	conn.Write(bytes)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
