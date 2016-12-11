@@ -4,6 +4,7 @@
 *.so
 *.pyc
 3700kvstore
+*.swp
 
 # Folders
 _obj
