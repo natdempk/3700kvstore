@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -42,7 +41,7 @@ type LogItem struct {
 	Term  int    `json:"term"`
 }
 
-var conn net.Conn
+var conn net.UnixConn
 
 // constants
 const LEADER = "leader"
@@ -86,7 +85,12 @@ func main() {
 	replicaIDs = os.Args[2:]
 
 	var err error
-	conn, err = net.Dial("unixpacket", myID)
+	//uconn, err := net.DialUnix("unixpacket", &net.UnixAddr{myID, "unixpacket"}, &net.UnixAddr{myID, "unixpacket"})
+	uconn, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{myID, "unixpacket"})
+	conn = *uconn
+	//ulistener, err2 := net.ListenUnix("unixpacket", &net.UnixAddr{myID, "unixpacket"})
+	//conn, err := ulistener.AcceptUnix()
+	//fmt.Println(err2)
 
 	if err != nil {
 		fmt.Println("TERRIBLE ERROR")
@@ -96,24 +100,46 @@ func main() {
 
 	go checkForElection()
 
-	d := json.NewDecoder(conn)
+	//d := json.NewDecoder(conn)
 
 	for {
 		var message Message
 
-		var j []byte = make([]byte, 1000)
-		d.Buffered().Read(j)
-		fmt.Println("Buffer Start::::::")
-		fmt.Println(string(j))
-		fmt.Println("Buffer End:::::::")
+		// err := d.Decode(&message)
 
-		err := d.Decode(&message)
+		var p []byte = make([]byte, 10000)
+		//con, err := ulistener.AcceptUnix()
+		//con.Read(p)
+		//fmt.Println("NOT SO SICK")
+		_, _, err := conn.ReadFromUnix(p)
 		if err != nil {
+			fmt.Println(string(p))
+			fmt.Printf("conn error")
+			fmt.Println(err)
+			//var p []byte = make([]byte, 1000)
+
+			//bufio.NewReader(conn).Read(p)
+			fmt.Println(string(p))
+			panic(err)
+		}
+
+		//fmt.Println("SICK")
+		//fmt.Println([]byte(string(p)))
+		for i, byt := range p {
+			if byt == '\x00' {
+				p = p[:i]
+				break
+			}
+		}
+		err = json.Unmarshal(p, &message)
+		//fmt.Println(string(p))
+		if err != nil {
+			fmt.Println(string(p))
 			fmt.Printf("horrible error")
 			fmt.Println(err)
-			var p []byte = make([]byte, 1000)
+			//var p []byte = make([]byte, 1000)
 
-			bufio.NewReader(conn).Read(p)
+			//bufio.NewReader(conn).Read(p)
 			fmt.Println(string(p))
 			panic(err)
 		}
@@ -121,7 +147,6 @@ func main() {
 		switch message.Type {
 		case "get":
 			fmt.Println("get")
-			break
 			if state == LEADER {
 				// provide results
 				found := false
@@ -171,11 +196,10 @@ func main() {
 					Leader:      leaderID,
 					Type:        "ok",
 				}
-				break
+				commitIndex++
 				sendMessage(okMessage)
 			} else {
 				fmt.Println("REDIRECT")
-				break
 				sendRedirect(message.Source, message.ID)
 			}
 		case "redirect":
@@ -216,7 +240,7 @@ func main() {
 				fmt.Println("granted vote")
 			}
 
-			if currentTermVotes > len(replicaIDs)/2 {
+			if state == CANDIDATE && currentTermVotes > len(replicaIDs)/2 {
 				// we are elected leader
 				fmt.Printf("LEADER ELECTED: %v\n", myID)
 				state = LEADER
@@ -297,10 +321,6 @@ func sendAppendEntriesRpc(destination string) {
 
 func handleAppendEntries(message Message) {
 
-	if len(message.Entries) > 0 {
-		fmt.Println("AKLSDJKLASJDKLJKLSALJKADLJLJDASJLKJKKLJDSKJLASDL")
-	}
-
 	// THIS MIGHT BE WRONG
 	if (state == CANDIDATE || state == FOLLOWER) &&
 		(message.Term > currentTerm || message.Leader != leaderID) {
@@ -339,13 +359,18 @@ func handleAppendEntries(message Message) {
 	}
 
 	if responseMessage.Success {
+		fmt.Println("LOG11111111111111111111")
+		fmt.Println(log)
+		fmt.Println("ENTRIESSSSSSSSS1111111")
+		fmt.Println(message.Entries)
 		log = append(log, message.Entries...)
+		fmt.Println("LOG222222222222222")
+		fmt.Println(log)
+		fmt.Println("LOGLENLOGLENLOGE")
+		fmt.Println(len(log))
+		fmt.Println("stop")
 		if message.LeaderCommit > commitIndex {
-			if message.LeaderCommit < len(log)-1 {
-				commitIndex = message.LeaderCommit
-			} else {
-				commitIndex = len(log) - 1
-			}
+			commitIndex = min(message.LeaderCommit, len(log)-1)
 		}
 	}
 
@@ -389,10 +414,11 @@ func sendMessage(message Message) {
 	}
 
 	//fmt.Fprintf(conn, string(bytes))
-	if len(log) != 0 {
-		fmt.Println(string(bytes))
-	}
+	//if len(log) != 0 {
+	//fmt.Println(string(bytes))
+	//}
 	conn.Write(bytes)
+	//conn.WriteToUnix(bytes, &net.UnixAddr{myID, "unixpacket"})
 }
 
 func min(a, b int) int {
