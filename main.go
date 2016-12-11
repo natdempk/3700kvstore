@@ -59,7 +59,6 @@ var votedFor = ""
 var log []LogItem = []LogItem{}
 var commitIndex = 0
 var lastApplied = 0
-var lastLogTerm = 0
 
 var lastHeartbeatTime = time.Now()
 
@@ -85,12 +84,8 @@ func main() {
 	replicaIDs = os.Args[2:]
 
 	var err error
-	//uconn, err := net.DialUnix("unixpacket", &net.UnixAddr{myID, "unixpacket"}, &net.UnixAddr{myID, "unixpacket"})
 	uconn, err := net.DialUnix("unixpacket", nil, &net.UnixAddr{myID, "unixpacket"})
 	conn = *uconn
-	//ulistener, err2 := net.ListenUnix("unixpacket", &net.UnixAddr{myID, "unixpacket"})
-	//conn, err := ulistener.AcceptUnix()
-	//fmt.Println(err2)
 
 	if err != nil {
 		fmt.Println("TERRIBLE ERROR")
@@ -105,26 +100,15 @@ func main() {
 	for {
 		var message Message
 
-		// err := d.Decode(&message)
-
 		var p []byte = make([]byte, 10000)
-		//con, err := ulistener.AcceptUnix()
-		//con.Read(p)
-		//fmt.Println("NOT SO SICK")
 		_, _, err := conn.ReadFromUnix(p)
 		if err != nil {
-			fmt.Println(string(p))
 			fmt.Printf("conn error")
 			fmt.Println(err)
-			//var p []byte = make([]byte, 1000)
-
-			//bufio.NewReader(conn).Read(p)
 			fmt.Println(string(p))
 			panic(err)
 		}
 
-		//fmt.Println("SICK")
-		//fmt.Println([]byte(string(p)))
 		for i, byt := range p {
 			if byt == '\x00' {
 				p = p[:i]
@@ -132,21 +116,16 @@ func main() {
 			}
 		}
 		err = json.Unmarshal(p, &message)
-		//fmt.Println(string(p))
 		if err != nil {
-			fmt.Println(string(p))
 			fmt.Printf("horrible error")
 			fmt.Println(err)
-			//var p []byte = make([]byte, 1000)
-
-			//bufio.NewReader(conn).Read(p)
 			fmt.Println(string(p))
 			panic(err)
 		}
 
 		switch message.Type {
 		case "get":
-			fmt.Println("get")
+			//fmt.Println("get")
 			if state == LEADER {
 				// provide results
 				found := false
@@ -181,7 +160,7 @@ func main() {
 				sendRedirect(message.Source, message.ID)
 			}
 		case "put":
-			fmt.Println("put")
+			//fmt.Println("put")
 			if state == LEADER {
 				// store results
 				log = append(log, LogItem{
@@ -199,26 +178,33 @@ func main() {
 				commitIndex++
 				sendMessage(okMessage)
 			} else {
-				fmt.Println("REDIRECT")
+				//fmt.Println("REDIRECT")
 				sendRedirect(message.Source, message.ID)
 			}
 		case "redirect":
 			fmt.Println("THIS SHOULD NEVER HAPPEN")
 			fmt.Println("SOMETHING WENT TERRIBLY WRONG")
 		case "fail":
-			fmt.Println("fail")
+			break
+			//fmt.Println("fail")
 		case "ok":
-			fmt.Println("ok")
+			//fmt.Println("ok")
+			break
 			// more to come
 		case LEADER_APPEND_ENTRIES:
 			handleAppendEntries(message)
 		case RESPONSE_APPEND_ENTRIES:
 			if message.Success {
-				nextIndex[message.Source] = message.CommitIndex + 1
-				matchIndex[message.Source] = message.CommitIndex
+				if message.CommitIndex < nextIndex[message.Source] {
+					//fmt.Println("SICK OUT OF ORDER MESSAGE, IGNORED")
+				} else {
+					nextIndex[message.Source] = message.CommitIndex + 1
+					matchIndex[message.Source] = message.CommitIndex
+				}
 			} else { // we aren't the leader
 				// decremented nextIndex and retry
-				nextIndex[message.Source] = message.CommitIndex + 1
+				//fmt.Printf("ELSE STATEMENT mESSSAGE: %v\n", message)
+				//nextIndex[message.Source] = message.CommitIndex + 1
 			}
 		case "requestVote":
 			if message.Term < currentTerm {
@@ -234,10 +220,10 @@ func main() {
 			}
 
 		case "vote":
-			fmt.Println("received vote")
+			//fmt.Println("received vote")
 			if message.VoteGranted {
 				currentTermVotes++
-				fmt.Println("granted vote")
+				//fmt.Println("granted vote")
 			}
 
 			if state == CANDIDATE && currentTermVotes > len(replicaIDs)/2 {
@@ -266,6 +252,11 @@ func checkForElection() {
 			state = CANDIDATE
 			votedFor = myID
 
+			lastLogTerm := 0
+			if len(log) > 0 {
+				lastLogTerm = log[len(log)-1].Term
+			}
+
 			electMe := Message{
 				ID:           uuid.NewV4().String(),
 				Destination:  "FFFF",
@@ -292,12 +283,19 @@ func sendAppendEntriesRpc(destination string) {
 
 	for state == LEADER {
 		if time.Since(leaderLastHeartbeatTime) > HEARTBEAT_TIMEOUT {
+
+			//fmt.Println("Sending append")
 			logOffset := min(nextIndex[destination], len(log)-1)
 			if logOffset < 0 {
 				logOffset = 0
 			}
-			var actualEntries = log[logOffset:]
 
+			lastLogTerm := 0
+			if len(log) > 0 {
+				//fmt.Println(len(log), nextIndex[destination])
+				lastLogTerm = log[max(nextIndex[destination]-2, 0)].Term
+			}
+			var actualEntries = log[logOffset:min(len(log), logOffset+20)]
 			appendEntriesMessage := Message{
 				ID:           uuid.NewV4().String(),
 				Type:         LEADER_APPEND_ENTRIES,
@@ -305,7 +303,7 @@ func sendAppendEntriesRpc(destination string) {
 				Source:       myID,
 				Leader:       leaderID,
 				Term:         currentTerm,
-				PrevLogIndex: lastApplied,
+				PrevLogIndex: max(nextIndex[destination]-1, 0),
 				PrevLogTerm:  lastLogTerm,
 				Entries:      actualEntries,
 				LeaderCommit: commitIndex,
@@ -340,39 +338,32 @@ func handleAppendEntries(message Message) {
 		Term:        currentTerm,
 	}
 
+	//fmt.Printf("max: %v, prevlogindex: %v\n", max(len(log), 0), message.PrevLogIndex)
 	if message.Term < currentTerm {
 		responseMessage.Success = false
-	} else if max(len(log)-1, 0) != message.PrevLogIndex &&
-		log[message.PrevLogIndex].Term != message.PrevLogTerm {
+
+	} else if message.PrevLogIndex > 0 &&
+		len(log) >= message.PrevLogIndex &&
+		log[max(0, message.PrevLogIndex-1)].Term != message.PrevLogTerm {
+		// this is the problem
 		responseMessage.Success = false
 	} else if len(log)-1 > message.PrevLogIndex {
-		for i := message.PrevLogIndex; i < len(log); i++ {
-			if log[i].Term != message.Entries[i-message.PrevLogIndex].Term {
-				log = log[:i]
-				message.Entries = message.Entries[i-message.PrevLogIndex:]
-				break
-			}
-		}
+		log = log[:message.PrevLogIndex]
 		responseMessage.Success = true
 	} else {
 		responseMessage.Success = true
 	}
 
 	if responseMessage.Success {
-		fmt.Println("LOG11111111111111111111")
-		fmt.Println(log)
-		fmt.Println("ENTRIESSSSSSSSS1111111")
-		fmt.Println(message.Entries)
 		log = append(log, message.Entries...)
-		fmt.Println("LOG222222222222222")
-		fmt.Println(log)
-		fmt.Println("LOGLENLOGLENLOGE")
-		fmt.Println(len(log))
-		fmt.Println("stop")
 		if message.LeaderCommit > commitIndex {
-			commitIndex = min(message.LeaderCommit, len(log)-1)
+			commitIndex = min(message.LeaderCommit, len(log))
 		}
+	} else {
+		//fmt.Println("Message not successful")
 	}
+
+	//fmt.Printf("SENDING US, logLen: %v, commitIndex: %v\n", len(log), commitIndex)
 
 	responseMessage.CommitIndex = commitIndex
 
@@ -413,12 +404,7 @@ func sendMessage(message Message) {
 		panic(err)
 	}
 
-	//fmt.Fprintf(conn, string(bytes))
-	//if len(log) != 0 {
-	//fmt.Println(string(bytes))
-	//}
 	conn.Write(bytes)
-	//conn.WriteToUnix(bytes, &net.UnixAddr{myID, "unixpacket"})
 }
 
 func min(a, b int) int {
