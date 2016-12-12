@@ -102,11 +102,6 @@ func checkForReplication(logIndex int, message Message) {
 		if state != LEADER || initialLeaderID != leaderID ||
 			time.Since(started) > 75*time.Millisecond {
 
-			if time.Since(started) > 75*time.Millisecond {
-				fmt.Println(nextIndex)
-				fmt.Println("oh god why")
-				fmt.Println(lastApplied, logIndex)
-			}
 			failureMessage := Message{
 				ID:          message.ID,
 				Source:      myID,
@@ -387,7 +382,7 @@ func sendAppendEntriesRpc(destination string, bypassTimeout bool) {
 		if bypassTimeout || time.Since(leaderLastHeartbeatTime) > HEARTBEAT_TIMEOUT {
 
 			//fmt.Println("Sending append")
-			logOffset := min(getIndex(destination), len(log)-1)
+			logOffset := min(getIndex(destination)-1, len(log)-1)
 			if logOffset < 0 {
 				logOffset = 0
 			}
@@ -398,7 +393,7 @@ func sendAppendEntriesRpc(destination string, bypassTimeout bool) {
 				lastLogTerm = log[max(getIndex(destination)-2, 0)].Term
 			}
 			var actualEntries = log[logOffset:min(len(log), logOffset+20)]
-			if myID == "0004" && destination == "0001" {
+			if myID == "0005" && destination == "0001" && false {
 				fmt.Println("send", log)
 			}
 			//if len(actualEntries) == 0 {
@@ -441,10 +436,6 @@ func handleAppendEntries(message Message) {
 		votedFor = ""
 	}
 
-	if myID == "0001" {
-		fmt.Println("handle", log)
-	}
-
 	lastHeartbeatTime = time.Now()
 
 	responseMessage := Message{
@@ -458,17 +449,16 @@ func handleAppendEntries(message Message) {
 	//fmt.Printf("max: %v, prevlogindex: %v\n", max(len(log), 0), message.PrevLogIndex)
 	if message.Term < currentTerm {
 		responseMessage.Success = false
-
 	} else if message.PrevLogIndex > 0 &&
 		len(log) >= message.PrevLogIndex &&
 		log[max(0, message.PrevLogIndex-1)].Term != message.PrevLogTerm {
 		// this is the problem
 		responseMessage.Success = false
-	} else if len(log)-1 > message.PrevLogIndex {
-		log = log[:message.PrevLogIndex]
-		responseMessage.Success = true
 	} else {
 		responseMessage.Success = true
+		//fmt.Println("log before slice: ", log)
+		log = log[:max(0, message.PrevLogIndex)]
+		//fmt.Println("log after slice: ", log)
 	}
 
 	if responseMessage.Success {
@@ -482,7 +472,14 @@ func handleAppendEntries(message Message) {
 
 	//fmt.Printf("SENDING US, logLen: %v, commitIndex: %v\n", len(log), commitIndex)
 
+	if myID == "0001" {
+		//fmt.Println("entries", message.Entries)
+		// 2 3 2
+		//fmt.Println(message.PrevLogIndex, meage.LeaderCommit, commitIndex)
+		//fmt.Println("handle", log)
+	}
 	responseMessage.CommitIndex = commitIndex
+	lastApplied = commitIndex
 
 	sendMessage(responseMessage)
 }
