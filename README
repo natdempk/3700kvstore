@@ -1,0 +1,18 @@
+3700kvstore
+CS3700 - Project 5
+Nathaniel Dempkowski and Sean Andrews, Team project5
+
+High-level Approach
+===================
+
+We have a main event-loop to read and react to them. Additionally we have another goroutine which handles sending heartbeats and periodic RPC calls. We also have another goroutine to check for and trigger elections if we haven't received heartbeats. We respond to messages by spinning off a goroutine with a timeout that waits until a message has been replicated to respond to it. Other than this, we essentially tried to do things according to the paper, to varying degrees of success.
+
+Challenges Faced
+================
+
+Along with the general issues of implementing this system based on a paper, we ran into a number of operational/library-related issues that lead to a lot of wasted development time chasing hard or impossible to solve problems. One of these problems was with the json decoder we had successfully used in other projects. We had an irreconcilable error that was fixed by manually reading packets and deserializing them, but we wasted a lot of time trying to chase this error and use proper debugging utilities to solve it. Additionally we ran into resource constraints on the CCIS machines relating to thread usage. Again because these errors manifest as errros within Go's C language bridge, they were almost impossible to debug. We realized too late that switching CCIS machines was some mitigation against these. On top of these, the incostent nature of the errors in our program, combined with the large volume of data made it very hard to chase down specific issues and come up with simpified cases that exposed race conditions.
+
+Testing
+=======
+
+We utilized print debugging along with the test scripts to try and test and debug our program. We tried to use a Go debugger, but they either didn't work with the version of Go on the CCIS machines, or didn't work on our local machines. This would have probably helped us actually complete the project, but oh well. We also could have written our code in a better style so it was more testable, but we only realized that way too late into the project.
