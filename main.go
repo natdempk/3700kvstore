@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/satori/go.uuid"
@@ -42,6 +43,7 @@ type LogItem struct {
 	Term  int    `json:"term"`
 }
 
+var happened = true
 var conn net.UnixConn
 
 // constants
@@ -66,10 +68,22 @@ var lastHeartbeatTime = time.Now()
 var currentTermVotes = 0
 var replicaIDs []string
 
-var committedValues = make(map[string]string)
-
 // leader state
+var nextIndexMutex sync.Mutex
 var nextIndex = make(map[string]int)
+
+func setNextIndex(s string, val int) {
+	nextIndexMutex.Lock()
+	defer nextIndexMutex.Unlock()
+	nextIndex[s] = val
+}
+
+func getIndex(s string) int {
+	nextIndexMutex.Lock()
+	defer nextIndexMutex.Unlock()
+	return nextIndex[s]
+}
+
 var matchIndex = make(map[string]int)
 
 func getElectionTimeout() (timeout time.Duration) {
@@ -82,13 +96,17 @@ func getElectionTimeout() (timeout time.Duration) {
 
 func checkForReplication(logIndex int, message Message) {
 	// TODO: weird stuff could happen, need a failure condition
-	//startTime := time.Now()
-
 	initialLeaderID := leaderID
+	started := time.Now()
+	for lastApplied < logIndex-1 {
+		if state != LEADER || initialLeaderID != leaderID ||
+			time.Since(started) > 75*time.Millisecond {
 
-	for lastApplied < logIndex {
-		if state != LEADER || initialLeaderID != leaderID {
-			fmt.Println("SOMETHING CHANGED")
+			if time.Since(started) > 75*time.Millisecond {
+				fmt.Println(nextIndex)
+				fmt.Println("oh god why")
+				fmt.Println(lastApplied, logIndex)
+			}
 			failureMessage := Message{
 				ID:          message.ID,
 				Source:      myID,
@@ -100,7 +118,7 @@ func checkForReplication(logIndex int, message Message) {
 			return
 		}
 
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	okMessage := Message{
@@ -109,6 +127,7 @@ func checkForReplication(logIndex int, message Message) {
 		Destination: message.Source,
 		Leader:      leaderID,
 		Type:        "ok",
+		Key:         message.Key,
 		Value:       log[logIndex-1].Value,
 	}
 
@@ -135,6 +154,10 @@ func main() {
 	//d := json.NewDecoder(conn)
 
 	for {
+		if !happened && len(log) > 30 {
+			fmt.Println(log)
+			happened = true
+		}
 		var message Message
 
 		var p []byte = make([]byte, 10000)
@@ -177,6 +200,7 @@ func main() {
 							Destination: message.Source,
 							Leader:      leaderID,
 							Type:        "ok",
+							Key:         message.Key,
 							Value:       log[i].Value,
 						}
 						found = true
@@ -191,7 +215,7 @@ func main() {
 						Source:      myID,
 						Destination: message.Source,
 						Leader:      leaderID,
-						Type:        "fail",
+						Type:        "ok",
 					}
 					sendMessage(failureMessage)
 				}
@@ -270,10 +294,10 @@ func main() {
 			handleAppendEntries(message)
 		case RESPONSE_APPEND_ENTRIES:
 			if message.Success {
-				if message.CommitIndex < nextIndex[message.Source] {
+				if message.CommitIndex < getIndex(message.Source) {
 					//fmt.Println("SICK OUT OF ORDER MESSAGE, IGNORED")
 				} else {
-					nextIndex[message.Source] = message.CommitIndex + 1
+					setNextIndex(message.Source, message.CommitIndex+1)
 					matchIndex[message.Source] = message.CommitIndex
 
 					lastApplied = computeLastApplied()
@@ -310,7 +334,7 @@ func main() {
 				// reinitialize matchIndex and nextIndex
 				for _, replica := range replicaIDs {
 					go sendAppendEntriesRpc(replica, false)
-					nextIndex[replica] = commitIndex + 1
+					setNextIndex(replica, commitIndex+1)
 					matchIndex[replica] = 0
 				}
 				lastApplied = computeLastApplied()
@@ -363,17 +387,20 @@ func sendAppendEntriesRpc(destination string, bypassTimeout bool) {
 		if bypassTimeout || time.Since(leaderLastHeartbeatTime) > HEARTBEAT_TIMEOUT {
 
 			//fmt.Println("Sending append")
-			logOffset := min(nextIndex[destination], len(log)-1)
+			logOffset := min(getIndex(destination), len(log)-1)
 			if logOffset < 0 {
 				logOffset = 0
 			}
 
 			lastLogTerm := 0
 			if len(log) > 0 {
-				//fmt.Println(len(log), nextIndex[destination])
-				lastLogTerm = log[max(nextIndex[destination]-2, 0)].Term
+				// fmt.Println(len(log), nextIndex[destination])
+				lastLogTerm = log[max(getIndex(destination)-2, 0)].Term
 			}
 			var actualEntries = log[logOffset:min(len(log), logOffset+20)]
+			if myID == "0004" && destination == "0001" {
+				fmt.Println("send", log)
+			}
 			//if len(actualEntries) == 0 {
 			//if time.Since(leaderLastHeartbeatTime) < EMPTY_HEARTBEAT_TIMEOUT {
 			//continue
@@ -386,7 +413,7 @@ func sendAppendEntriesRpc(destination string, bypassTimeout bool) {
 				Source:       myID,
 				Leader:       leaderID,
 				Term:         currentTerm,
-				PrevLogIndex: max(nextIndex[destination]-1, 0),
+				PrevLogIndex: max(getIndex(destination)-1, 0),
 				PrevLogTerm:  lastLogTerm,
 				Entries:      actualEntries,
 				LeaderCommit: commitIndex,
@@ -407,12 +434,15 @@ func sendAppendEntriesRpc(destination string, bypassTimeout bool) {
 func handleAppendEntries(message Message) {
 
 	// THIS MIGHT BE WRONG
-	if (state == CANDIDATE || state == FOLLOWER) &&
-		(message.Term > currentTerm || message.Leader != leaderID) {
+	if message.Term > currentTerm || message.Leader != leaderID {
 		currentTerm = message.Term
 		leaderID = message.Leader
 		state = FOLLOWER
 		votedFor = ""
+	}
+
+	if myID == "0001" {
+		fmt.Println("handle", log)
 	}
 
 	lastHeartbeatTime = time.Now()
@@ -425,7 +455,6 @@ func handleAppendEntries(message Message) {
 		Type:        RESPONSE_APPEND_ENTRIES,
 		Term:        currentTerm,
 	}
-
 	//fmt.Printf("max: %v, prevlogindex: %v\n", max(len(log), 0), message.PrevLogIndex)
 	if message.Term < currentTerm {
 		responseMessage.Success = false
@@ -497,12 +526,14 @@ func sendMessage(message Message) {
 
 func computeLastApplied() int {
 	var vals []int
+	nextIndexMutex.Lock()
+	defer nextIndexMutex.Unlock()
 	for _, ind := range nextIndex {
 		vals = append(vals, ind)
 	}
 	sort.Ints(vals)
 
-	return vals[max(0, (len(vals)/2)-1)] - 1
+	return vals[max(0, len(vals)/2)] - 1
 }
 
 func min(a, b int) int {
